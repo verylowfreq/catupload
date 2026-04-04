@@ -1,27 +1,23 @@
 ﻿use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use hidapi::{HidApi, HidDevice};
 
 #[repr(u8)]
 #[derive(Copy, Clone, Debug)]
 enum Command {
-    Nop = 0,
     Ident = 1,
     Erase = 2,
     ProgramStart = 3,
     ProgramAppend = 4,
     Flush = 5,
-    Read = 6,
     Reset = 7,
     Crc = 8,
 }
 
 const TIMEOUT: Duration = Duration::from_millis(100);
-const READ_BLOCK_SIZE: usize = 62;
 const WRITE_BLOCK_SIZE: usize = 54;
 const FLUSH_PAGE_SIZE: usize = 4096;
 const PACKET_SIZE: usize = 64;
@@ -44,12 +40,6 @@ struct Cli {
     /// PID (default 0x6585)
     #[arg(long, default_value = "0x6585", value_parser = parse_u16, value_name = "PID")]
     pid: u16,
-    /// Product string to match for HID (use empty to skip)
-    #[arg(long, default_value = "HID Bootloader", value_name = "NAME")]
-    product: String,
-    /// Erase before programming
-    #[arg(long, default_value_t = false)]
-    erase: bool,
     /// Verify CRC16 after programming
     #[arg(long, default_value_t = false)]
     verify: bool,
@@ -93,26 +83,6 @@ impl Bootloader {
         let end = len.saturating_add(2).min(resp.len());
         let text = std::str::from_utf8(&resp[2..end]).context("IDENT returned invalid UTF-8")?;
         Ok(text.to_string())
-    }
-
-    fn read(&self, start_address: u32, size: usize) -> Result<Vec<u8>> {
-        let mut remaining = size;
-        let mut address = start_address;
-        let mut data = Vec::with_capacity(size);
-
-        while remaining > 0 {
-            let read_len = remaining.min(READ_BLOCK_SIZE) as u32;
-            let resp = self.send(Command::Read, address, read_len, &[], TIMEOUT)?;
-            let payload_len = usize::min(
-                *resp.get(1).unwrap_or(&0) as usize,
-                resp.len().saturating_sub(2),
-            );
-            data.extend_from_slice(&resp[2..2 + payload_len]);
-            address = address.wrapping_add(read_len);
-            remaining -= read_len as usize;
-        }
-
-        Ok(data)
     }
 
     fn write(&self, start_address: u32, data: &[u8]) -> Result<()> {
@@ -210,74 +180,6 @@ impl Bootloader {
     fn send_without_response(&self, command: Command, param1: u32, param2: u32, data: &[u8]) -> Result<()> {
         self.transport
             .send_without_response(command, param1, param2, data)
-    }
-}
-
-struct HidTransport {
-    device: HidDevice,
-}
-
-impl HidTransport {
-    fn new(device: HidDevice) -> Self {
-        Self { device }
-    }
-}
-
-impl BootTransport for HidTransport {
-    fn send(
-        &self,
-        command: Command,
-        param1: u32,
-        param2: u32,
-        data: &[u8],
-        timeout: Duration,
-    ) -> Result<Vec<u8>> {
-        let payload = build_payload(command, param1, param2, data);
-
-        let mut packet = Vec::with_capacity(PACKET_SIZE + 1);
-        packet.push(0);
-        packet.extend_from_slice(&payload);
-        self.device
-            .write(&packet)
-            .context("HID write failed")?;
-
-        let deadline = Instant::now() + timeout;
-        let mut resp = vec![0u8; PACKET_SIZE];
-
-        while Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let timeout_ms = remaining.as_millis().clamp(1, i64::from(i32::MAX) as u128) as i32;
-            let read_len = self
-                .device
-                .read_timeout(&mut resp, timeout_ms)
-                .context("HID read failed")?;
-            if read_len == PACKET_SIZE {
-                return Ok(resp);
-            }
-        }
-
-        bail!("HID response timeout");
-    }
-
-    fn send_without_response(
-        &self,
-        command: Command,
-        param1: u32,
-        param2: u32,
-        data: &[u8],
-    ) -> Result<()> {
-        let payload = build_payload(command, param1, param2, data);
-        let mut packet = Vec::with_capacity(PACKET_SIZE + 1);
-        packet.push(0);
-        packet.extend_from_slice(&payload);
-        self.device
-            .write(&packet)
-            .context("HID write failed")?;
-        Ok(())
-    }
-
-    fn kind(&self) -> &'static str {
-        "HID"
     }
 }
 
@@ -415,16 +317,6 @@ mod nusb_transport {
             endpoint_in,
             endpoint_out,
         })
-    }
-
-    fn is_winusb_driver(dev: &nusb::DeviceInfo) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            if let Some(driver) = dev.driver() {
-                return driver.eq_ignore_ascii_case("winusb");
-            }
-        }
-        false
     }
 
     fn find_vendor_bulk_interface(
@@ -574,36 +466,21 @@ fn crc16_ccitt(data: &[u8]) -> u16 {
     crc
 }
 
-fn open_hid_transport(cli: &Cli) -> Result<HidTransport> {
-    let api = HidApi::new().context("HID API init failed")?;
-    let device = api
-        .open(cli.vid, cli.pid)
-        .context("HID device open failed")?;
-
-    if !cli.product.is_empty() {
-        let product_string = device
-            .get_product_string()
-            .context("HID product string read failed")?;
-        if let Some(name) = product_string {
-            if name != cli.product {
-                bail!("Product name mismatch: device=\"{name}\" expected=\"{}\"", cli.product);
-            }
-        } else {
-            bail!("HID product string missing");
-        }
-    }
-
-    Ok(HidTransport::new(device))
+fn erase_range(start_address: u32, size: usize) -> Result<(u32, usize)> {
+    let erase_start = start_address & !((FLUSH_PAGE_SIZE as u32) - 1);
+    let end_address = start_address
+        .checked_add(u32::try_from(size).context("firmware size exceeds 32-bit address space")?)
+        .context("erase end address overflow")?;
+    let erase_end = end_address
+        .checked_add((FLUSH_PAGE_SIZE as u32) - 1)
+        .context("erase end address overflow")?
+        & !((FLUSH_PAGE_SIZE as u32) - 1);
+    let erase_size = usize::try_from(erase_end - erase_start).context("erase range too large")?;
+    Ok((erase_start, erase_size))
 }
 
 fn open_transport(cli: &Cli) -> Result<Box<dyn BootTransport>> {
-    match nusb_transport::NusbTransport::open(cli.vid, cli.pid) {
-        Ok(transport) => Ok(Box::new(transport)),
-        Err(err) => {
-            eprintln!("NUSB open failed, retrying with HID: {err:?}");
-            Ok(Box::new(open_hid_transport(cli)?))
-        }
-    }
+    Ok(Box::new(nusb_transport::NusbTransport::open(cli.vid, cli.pid)?))
 }
 
 fn run() -> Result<()> {
@@ -627,33 +504,19 @@ fn run() -> Result<()> {
     );
 
     let transport = open_transport(&cli)?;
-    let mut boot = Bootloader::new(transport);
+    let boot = Bootloader::new(transport);
     println!("Transport: {}", boot.transport_kind());
-    let ident = match boot.get_ident() {
-        Ok(ident) => ident,
-        Err(err) => {
-            if boot.transport_kind() == "NUSB" {
-                eprintln!("IDENT failed over NUSB, retrying with HID: {err:?}");
-                boot = Bootloader::new(Box::new(open_hid_transport(&cli)?));
-                println!("Transport: {}", boot.transport_kind());
-                boot.get_ident()?
-            } else {
-                return Err(err);
-            }
-        }
-    };
+    let ident = boot.get_ident()?;
     println!("Ident: {ident}");
 
-    if cli.erase {
-        let erase_size = ((firmware.len() + FLUSH_PAGE_SIZE - 1) / FLUSH_PAGE_SIZE) * FLUSH_PAGE_SIZE;
-        println!(
-            "Erase: addr=0x{start:08x} size={size} ({} KB)",
-            erase_size / 1024,
-            start = start_address,
-            size = erase_size
-        );
-        boot.erase(start_address, erase_size)?;
-    }
+    let (erase_start, erase_size) = erase_range(start_address, firmware.len())?;
+    println!(
+        "Erase: addr=0x{start:08x} size={size} ({} KB)",
+        erase_size / 1024,
+        start = erase_start,
+        size = erase_size
+    );
+    boot.erase(erase_start, erase_size)?;
 
     println!(
         "Program: addr=0x{start:08x} size={} bytes",
