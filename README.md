@@ -43,4 +43,5 @@ cargo build --release
 ## Notes
 - Erase is always performed automatically before programming.
 - The erase range is expanded to 4 KB page boundaries as needed.
+- If multiple devices match the requested VID/PID, the tool aborts without programming.
 - The tool resets the device after a successful run.

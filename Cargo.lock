@@ -71,6 +71,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
 
 [[package]]
+name = "catupload"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-lite",
+ "nusb",
+]
+
+[[package]]
 name = "clap"
 version = "4.5.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,16 +188,6 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
-
-[[package]]
-name = "hidupload"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "futures-lite",
- "nusb",
-]
 
 [[package]]
 name = "io-kit-sys"
