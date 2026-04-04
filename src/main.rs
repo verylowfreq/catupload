@@ -208,6 +208,13 @@ mod nusb_transport {
 
             log_device_candidates(&devices);
 
+            if devices.len() > 1 {
+                bail!(
+                    "multiple matching USB devices found (vid=0x{vid:04x} pid=0x{pid:04x} count={})",
+                    devices.len()
+                );
+            }
+
             let mut preferred = Vec::with_capacity(devices.len());
             // let mut fallback = Vec::new();
             preferred.extend(devices);
