@@ -40,9 +40,6 @@ struct Cli {
     /// PID (default 0x6585)
     #[arg(long, default_value = "0x6585", value_parser = parse_u16, value_name = "PID")]
     pid: u16,
-    /// Serial port name/path used for 1200bps touch reset
-    #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "PORT")]
-    serialport: Option<String>,
     /// Verify CRC16 after programming
     #[arg(long, default_value_t = false)]
     verify: bool,
@@ -490,49 +487,9 @@ fn erase_range(start_address: u32, size: usize) -> Result<(u32, usize)> {
 }
 
 fn open_transport(cli: &Cli) -> Result<Box<dyn BootTransport>> {
-    let serialport = cli.serialport.as_deref().unwrap_or("").trim();
-    let transport = if serialport.is_empty() {
-        nusb_transport::NusbTransport::open(cli.vid, cli.pid)?
-    } else {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-
-        loop {
-            match nusb_transport::NusbTransport::open(cli.vid, cli.pid) {
-                Ok(transport) => break transport,
-                Err(err) => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(err.context("timed out waiting for target USB device"));
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        }
-    };
+    let transport = nusb_transport::NusbTransport::open(cli.vid, cli.pid)?;
 
     Ok(Box::new(transport))
-}
-
-fn touch_serial_port_for_bootloader(port_name: &str) -> Result<()> {
-    let port_name = port_name.trim();
-    if port_name.is_empty() {
-        return Ok(());
-    }
-
-    println!("Touch serial port at 1200bps: {port_name}");
-    let mut port = serialport::new(port_name, 1200)
-        .timeout(Duration::from_millis(100))
-        .open()
-        .with_context(|| format!("failed to open serial port for 1200bps touch: {port_name}"))?;
-
-    // Keep the port open briefly so the target can observe the line coding,
-    // then close it to trigger the reset path.
-    let _ = port.write_data_terminal_ready(false);
-    let _ = port.write_request_to_send(false);
-    std::thread::sleep(Duration::from_millis(250));
-    drop(port);
-    std::thread::sleep(Duration::from_millis(250));
-
-    Ok(())
 }
 
 fn run() -> Result<()> {
@@ -554,8 +511,6 @@ fn run() -> Result<()> {
         vid = cli.vid,
         pid = cli.pid
     );
-
-    touch_serial_port_for_bootloader(cli.serialport.as_deref().unwrap_or(""))?;
 
     let transport = open_transport(&cli)?;
     let boot = Bootloader::new(transport);
